@@ -1,0 +1,444 @@
+<html>
+
+<head>
+<title>Learning WebGL &mdash; lesson 3</title>
+<meta http-equiv="content-type" content="text/html; charset=ISO-8859-1">
+
+<script type="text/javascript" src="gl-matrix.js"></script>
+<!-- <script type="text/javascript" src="glMatrix&#45;0.9.5.min.js"></script> -->
+<script type="text/javascript" src="webgl-utils.js"></script>
+
+<script id="shader-fs" type="x-shader/x-fragment">
+    precision mediump float;
+
+    varying vec4 vColor;
+
+    void main(void) {
+        gl_FragColor = vColor;
+    }
+</script>
+
+<script id="shader-vs" type="x-shader/x-vertex">
+    attribute vec3 aVertexPosition;
+    attribute vec4 aVertexColor;
+
+    uniform mat4 uMVMatrix;
+    uniform mat4 uPMatrix;
+
+    varying vec4 vColor;
+
+    void main(void) {
+        gl_Position = uPMatrix * uMVMatrix * vec4(aVertexPosition, 1.0);
+        vColor = aVertexColor;
+    }
+</script>
+
+
+<script type="text/javascript">
+
+    var gl;
+    var rTri = 0;
+    var NUM_BOIDS = 100;
+    var boids = [];
+    var minX = -2.5;
+    var maxX = 4;
+    var minY = -3.5;
+    var maxY = 3;
+    var minZ = -10;
+    var maxZ = -4;
+    var BOID_UNITS = 100;
+    var MIN_BOID_DISTANCE = 0.2;
+    var WIND_ITERATIONS = 40000;
+    var SCATTER_ITERATIONS = 1000;
+
+    // extend vec3 for debugging
+    vec3.toString = function (v) {
+        return v[0] + ', ' + v[1] + ', ' + v[2];
+    };
+
+    vec3.distance = function(a, b) {
+        var x = b[0] - a[0],
+            y = b[1] - a[1],
+            z = b[2] - a[2];
+        return Math.sqrt(x*x + y*y + z*z);
+    };
+
+    vec3.divideByScalar = function(out, a, scalar) {
+        out[0] = a[0] / scalar;
+        out[1] = a[1] / scalar;
+        out[2] = a[2] / scalar;
+        return out;
+    };
+
+    function initGL(canvas) {
+        try {
+            gl = canvas.getContext("experimental-webgl");
+            gl.viewportWidth = canvas.width;
+            gl.viewportHeight = canvas.height;
+        } catch (e) {
+        }
+        if (!gl) {
+            alert("Could not initialise WebGL, sorry :-(");
+        }
+    }
+
+
+    function getShader(gl, id) {
+        var shaderScript = document.getElementById(id);
+        if (!shaderScript) {
+            return null;
+        }
+
+        var str = "";
+        var k = shaderScript.firstChild;
+        while (k) {
+            if (k.nodeType == 3) {
+                str += k.textContent;
+            }
+            k = k.nextSibling;
+        }
+
+        var shader;
+        if (shaderScript.type == "x-shader/x-fragment") {
+            shader = gl.createShader(gl.FRAGMENT_SHADER);
+        } else if (shaderScript.type == "x-shader/x-vertex") {
+            shader = gl.createShader(gl.VERTEX_SHADER);
+        } else {
+            return null;
+        }
+
+        gl.shaderSource(shader, str);
+        gl.compileShader(shader);
+
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+            alert(gl.getShaderInfoLog(shader));
+            return null;
+        }
+
+        return shader;
+    }
+
+
+    var shaderProgram;
+
+    function initShaders() {
+        var fragmentShader = getShader(gl, "shader-fs");
+        var vertexShader = getShader(gl, "shader-vs");
+
+        shaderProgram = gl.createProgram();
+        gl.attachShader(shaderProgram, vertexShader);
+        gl.attachShader(shaderProgram, fragmentShader);
+        gl.linkProgram(shaderProgram);
+
+        if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+            alert("Could not initialise shaders");
+        }
+
+        gl.useProgram(shaderProgram);
+
+        shaderProgram.vertexPositionAttribute = gl.getAttribLocation(shaderProgram, "aVertexPosition");
+        gl.enableVertexAttribArray(shaderProgram.vertexPositionAttribute);
+
+        shaderProgram.vertexColorAttribute = gl.getAttribLocation(shaderProgram, "aVertexColor");
+        gl.enableVertexAttribArray(shaderProgram.vertexColorAttribute);
+
+        shaderProgram.pMatrixUniform = gl.getUniformLocation(shaderProgram, "uPMatrix");
+        shaderProgram.mvMatrixUniform = gl.getUniformLocation(shaderProgram, "uMVMatrix");
+    }
+
+
+    var mvMatrix = mat4.create();
+    var mvMatrixStack = [];
+    var pMatrix = mat4.create();
+
+    function mvPushMatrix() {
+        var copy = mat4.create();
+        mat4.set(mvMatrix, copy);
+        mvMatrixStack.push(copy);
+    }
+
+    function mvPopMatrix() {
+        if (mvMatrixStack.length == 0) {
+            throw "Invalid popMatrix!";
+        }
+        mvMatrix = mvMatrixStack.pop();
+    }
+
+
+    function setMatrixUniforms() {
+        gl.uniformMatrix4fv(shaderProgram.pMatrixUniform, false, pMatrix);
+        gl.uniformMatrix4fv(shaderProgram.mvMatrixUniform, false, mvMatrix);
+    }
+
+
+    function degToRad(degrees) {
+        return degrees * Math.PI / 180;
+    }
+
+
+    var triangleVertexPositionBuffer;
+    var triangleVertexColorBuffer;
+    var squareVertexPositionBuffer;
+    var squareVertexColorBuffer;
+
+    function initBuffers() {
+        triangleVertexPositionBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, triangleVertexPositionBuffer);
+        var vertices = [
+             0.0,  1.0,  0.0,
+            -1.0, -1.0,  0.0,
+             1.0, -1.0,  0.0
+        ];
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertices), gl.STATIC_DRAW);
+        triangleVertexPositionBuffer.itemSize = 3;
+        triangleVertexPositionBuffer.numItems = 3;
+
+        triangleVertexColorBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, triangleVertexColorBuffer);
+        var colors = [
+            1.0, 0.0, 0.0, 1.0,
+            0.0, 1.0, 0.0, 1.0,
+            0.0, 0.0, 1.0, 1.0,
+        ];
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(colors), gl.STATIC_DRAW);
+        triangleVertexColorBuffer.itemSize = 4;
+        triangleVertexColorBuffer.numItems = 3;
+
+
+        squareVertexPositionBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, squareVertexPositionBuffer);
+        vertices = [
+             1.0,  1.0,  0.0,
+            -1.0,  1.0,  0.0,
+             1.0, -1.0,  0.0,
+            -1.0, -1.0,  0.0
+            ];
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertices), gl.STATIC_DRAW);
+        squareVertexPositionBuffer.itemSize = 3;
+        squareVertexPositionBuffer.numItems = 4;
+
+        squareVertexColorBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, squareVertexColorBuffer);
+        colors = []
+        for (var i=0; i < 4; i++) {
+            colors = colors.concat([0.5, 0.5, 1.0, 1.0]);
+        }
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(colors), gl.STATIC_DRAW);
+        squareVertexColorBuffer.itemSize = 4;
+        squareVertexColorBuffer.numItems = 4;
+    }
+
+    function randPos(mult) {
+        mult = mult || 1;
+        var sign = Math.random() < 0.5 ? 1 : -1;
+
+        var x = Math.random() * mult * sign;
+        var y = Math.random() * mult * -sign;
+        var z = Math.random() * mult * -sign;
+        return {x: x, y: y, z: z};
+    }
+
+
+    function drawScene() {
+        gl.viewport(0, 0, gl.viewportWidth, gl.viewportHeight);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+        mat4.perspective(45, gl.viewportWidth / gl.viewportHeight, 0.1, 100.0, pMatrix);
+        // mat4.inverse(pInverseMatrix, pMatrix);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, triangleVertexPositionBuffer);
+        gl.vertexAttribPointer(shaderProgram.vertexPositionAttribute, triangleVertexPositionBuffer.itemSize, gl.FLOAT, false, 0, 0);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, triangleVertexColorBuffer);
+        gl.vertexAttribPointer(shaderProgram.vertexColorAttribute, triangleVertexColorBuffer.itemSize, gl.FLOAT, false, 0, 0);
+
+        for (var i = 0; i < NUM_BOIDS; i++) {
+            mat4.identity(mvMatrix);
+
+            mat4.translate(mvMatrix, boids[i].position);
+            mat4.scale(mvMatrix, [0.08, 0.08, 0.08]);
+
+            mvPushMatrix();
+            //mat4.rotate(mvMatrix, degToRad(rTri), [0, 1, 0]);
+
+            setMatrixUniforms();
+            gl.drawArrays(gl.TRIANGLES, 0, triangleVertexPositionBuffer.numItems);
+            mvPopMatrix();
+        }
+    }
+
+
+    var lastTime = 0;
+    var iterations = 0;
+    var scatterIterations = 0;
+
+    function animate() {
+        var timeNow = new Date().getTime();
+        var v1, v2, v3, v4, v, boid;
+
+        if (lastTime != 0) {
+            var elapsed = timeNow - lastTime;
+            var dt = elapsed / 1000;
+
+            for (var i = 0; i < NUM_BOIDS; i++) {
+                boid = boids[i]
+                v1 = rule1(boid, i);
+                v2 = rule2(boid, i); 
+                v3 = rule3(boid, i);
+
+                if (scatterIterations >= SCATTER_ITERATIONS) {
+                    v1 = vec3.multiply(v1, vec3.createFrom(-1, -1, -1));
+                }
+                vec3.add(boid.velocity, v1);
+                vec3.add(boid.velocity, v2);
+                vec3.add(boid.velocity, v3);
+                vec3.add(boid.velocity, strong_wind(boid));
+                vec3.add(boid.velocity, bound_position(boid));
+
+                vec3.multiply(boid.velocity, vec3.createFrom(dt, dt, dt));
+                vec3.add(boids[i].position, boids[i].velocity);
+                
+                if (i === 0) {
+                    console.log(vec3.toString(boids[0].position));
+                }
+            }
+            rTri += (90 * elapsed) / 1000.0;
+        }
+        lastTime = timeNow;
+        iterations++;
+        scatterIterations++;
+
+        if (scatterIterations > SCATTER_ITERATIONS) {
+            document.querySelector('#log').innerHTML += '<b>SCATTER!</b><br/>';
+            scatterIterations = 0;
+        }
+    }
+
+    function initBoids() {
+        var p;
+        for (var i = 0; i < NUM_BOIDS; i++) {
+            // they all start around one point
+            p = randPos(10); 
+            boids[i] = {position: vec3.createFrom(-1.5 + p.x, 0.0 + p.y, -7.0 + p.x), velocity: vec3.create()};
+        }
+    }
+
+    // Boids rule 1
+    // Boids try to fly towards the centre of mass of neighbouring boids
+    function rule1 (boid, boidIdx) {
+        // sum of all other boids' positions
+        var pcj = vec3.create();
+
+        for (var i = 0; i < NUM_BOIDS; i++) {
+            if (boidIdx !== i) {
+                pcj = vec3.add(pcj, boids[i].position);
+            }
+        }
+        vec3.divideByScalar(pcj, pcj, NUM_BOIDS - 1);
+        vec3.subtract(pcj, boid.position);
+
+        return vec3.divideByScalar(pcj, pcj, BOID_UNITS);
+    }
+
+    // Boids rule 2
+    // Boids try to keep a small distance away from other objects (including other boids).
+    function rule2 (boid, boidIdx) {
+        var c = vec3.create();
+
+        for (var i = 0; i < NUM_BOIDS; i++) {
+            if (boidIdx !== i) {
+                if (vec3.distance(boids[i].position, boid.position) < MIN_BOID_DISTANCE) {
+                    vec3.subtract(c, vec3.subtract(boids[i].position, boid.position, vec3.create()));
+                }
+            }
+        }
+        return c;
+    }
+
+    // Boids rule 3
+    // Boids try to match velocity with near boids.
+    function rule3 (boid, boidIdx) {
+        var pvj = vec3.create();
+
+        for (var i = 0; i < NUM_BOIDS; i++) {
+            if (boidIdx !== i) {
+                pvj = vec3.add(pvj, boids[i].velocity);
+            }
+        }
+        vec3.divideByScalar(pvj, pvj, NUM_BOIDS - 1);
+        vec3.subtract(pvj, boid.velocity);
+
+        return vec3.divideByScalar(pvj, pvj, 8);
+    }
+
+    var winds = 0;
+    var lastWind;
+
+    function strong_wind (boid) {
+
+        if (!lastWind || winds++ >  WIND_ITERATIONS) {
+            var p = randPos(1.5);
+            lastWind = vec3.createFrom(p.x, p.y, p.z);
+            winds = 0;
+            document.querySelector('#wind').innerHTML = 'Wind direction: ' + vec3.toString(lastWind);
+        }
+        return lastWind;
+    }
+
+    function bound_position (boid) {
+        var v = vec3.create();
+
+        if (boid.position[0] > maxX) {
+            v[0] = -1;
+        }
+        else if (boid.position[0] < minX) {
+            v[0] = 1;
+        }
+        if (boid.position[1] > maxY) {
+            v[1] = -1;
+        }
+        else if (boid.position[1] < minY) {
+            v[1] = 1;
+        }
+        if (boid.position[2] > maxZ) {
+            v[2] = -1;
+        }
+        else if (boid.position[2] < minZ) {
+            v[2] = 1;
+        }
+        return v;
+    }
+
+    function tick() {
+        requestAnimFrame(tick);
+        drawScene();
+        animate();
+    }
+
+
+    function webGLStart() {
+        var canvas = document.getElementById("lesson03-canvas");
+        initGL(canvas);
+        initShaders()
+        initBuffers();
+        initBoids();
+
+        gl.clearColor(0.0, 0.0, 0.0, 1.0);
+        gl.enable(gl.DEPTH_TEST);
+
+        tick();
+    }
+
+</script>
+
+</head>
+
+
+<body onload="webGLStart();">
+
+    <canvas id="lesson03-canvas" style="border: none;" width="1024" height="800"></canvas>
+    <p id="wind"/>
+    <p id="log"/>
+</body>
+
+</html>
